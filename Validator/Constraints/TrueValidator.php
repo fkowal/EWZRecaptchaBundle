@@ -141,12 +141,17 @@ class TrueValidator extends ConstraintValidator {
     }
 
     /**
-     * @return Client
+     * @return \Guzzle\Http\Client
      */
     public function getClient() {
         return $this->client;
     }
 
+    /**
+     * @param \Guzzle\Http\Client $client
+     *
+     * @return null
+     */
     public function setClient($client) {
         if (!$client) {
             $client = new \Guzzle\Http\Client();
@@ -160,6 +165,14 @@ class TrueValidator extends ConstraintValidator {
         ));
     }
 
+    /**
+     * @param string $url
+     * @param string $path
+     * @param array  $params
+     * @param array  $options
+     *
+     * @return \Guzzle\Http\Message\Response
+     */
     protected function httpPost($url, $path, $params, $options = array())
     {
         $client = $this->getClient();
