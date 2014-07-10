@@ -7,15 +7,15 @@ use Symfony\Component\Validator\Constraint;
 use Symfony\Component\Validator\ConstraintValidator;
 use Symfony\Component\Validator\Exception\ValidatorException;
 
-class TrueValidator extends ConstraintValidator
-{
-    protected $container;
-    protected $cache;
+class TrueValidator extends ConstraintValidator {
+    const RECAPTCHA_VERIFY_SERVER = 'http://www.google.com';
 
-    /**
-     * The reCAPTCHA server URL's
-     */
-    const RECAPTCHA_VERIFY_SERVER = 'www.google.com';
+    protected $container;
+    private $url = self::RECAPTCHA_VERIFY_SERVER;
+    private $options = array(
+        'timeout'=>0.5,
+        'connect_timeout'=>0.5,
+    );
 
     /**
      * Construct.
@@ -25,6 +25,7 @@ class TrueValidator extends ConstraintValidator
     public function __construct(ContainerInterface $container)
     {
         $this->container = $container;
+        $this->setClient(null);
     }
 
     /**
@@ -32,7 +33,6 @@ class TrueValidator extends ConstraintValidator
      */
     public function validate($value, Constraint $constraint)
     {
-        // if recaptcha is disabled, always valid
         if (!$this->container->getParameter('ewz_recaptcha.enabled')) {
             return true;
         }
@@ -40,40 +40,52 @@ class TrueValidator extends ConstraintValidator
         // define variable for recaptcha check answer
         $privateKey = $this->container->getParameter('ewz_recaptcha.private_key');
 
-        $remoteip   = $this->container->get('request')->server->get('REMOTE_ADDR');
-        $challenge  = $this->container->get('request')->get('recaptcha_challenge_field');
-        $response   = $this->container->get('request')->get('recaptcha_response_field');
+        $request = $this->container->get('request');
+        $remoteip = $this->getRealIp($request->server);
+        $challenge  = $request->get('recaptcha_challenge_field');
+        $response   = $request->get('recaptcha_response_field');
 
-        if (
-            isset($this->cache[$privateKey]) &&
-            isset($this->cache[$privateKey][$remoteip]) &&
-            isset($this->cache[$privateKey][$remoteip][$challenge]) &&
-            isset($this->cache[$privateKey][$remoteip][$challenge][$response])
-        ) {
-            $cached = $this->cache[$privateKey][$remoteip][$challenge][$response];
-        } else {
-            $cached = $this->cache[$privateKey][$remoteip][$challenge][$response] = $this->checkAnswer($privateKey, $remoteip, $challenge, $response);
-        }
+        $answer = $this->checkAnswer($privateKey, $remoteip, $challenge, $response);
 
-        if (!$cached) {
+        if (!$answer) {
             $this->context->addViolation($constraint->message);
         }
     }
 
     /**
-      * Calls an HTTP POST function to verify if the user's guess was correct
-      *
-      * @param string $privateKey
-      * @param string $remoteip
-      * @param string $challenge
-      * @param string $response
-      * @param array $extra_params an array of extra variables to post to the server
-      *
-      * @throws ValidatorException When missing remote ip
-      *
-      * @return Boolean
-      */
-    private function checkAnswer($privateKey, $remoteip, $challenge, $response, $extra_params = array())
+     * @param ParameterBag $server
+     *
+     * @return string
+     */
+    protected function getRealIp($server) {
+        $remoteip = null;
+        if ($server->has('REALIP') ) {
+            $remoteip = $server->get('REALIP');
+        }
+        if (!$remoteip && $server->has('X_REAL_IP') ) {
+            $remoteip = $server->get('X_REAL_IP');
+        }
+        if (!$remoteip ) {
+            $remoteip = $server->get('REMOTE_ADDR');
+        }
+        return $remoteip;
+    }
+
+    /**
+     * Calls an HTTP POST function to verify if the user's guess was correct
+     *
+     * @param string $privateKey
+     * @param string $remoteip
+     * @param string $challenge
+     * @param string $response
+     * @param array $extra_params array $extra_params an array of extra variables to post to the server
+     *
+     * @throws \Guzzle\Http\Exception\CurlException
+     *
+     * @throws \Symfony\Component\Validator\Exception\ValidatorException
+     * @return Boolean
+     */
+    protected function checkAnswer($privateKey, $remoteip, $challenge, $response, $extra_params = array())
     {
         if ($remoteip == null || $remoteip == '') {
             throw new ValidatorException('For security reasons, you must pass the remote ip to reCAPTCHA');
@@ -83,15 +95,25 @@ class TrueValidator extends ConstraintValidator
         if ($challenge == null || strlen($challenge) == 0 || $response == null || strlen($response) == 0) {
             return false;
         }
+        $url = $this->getUrl();
 
-        $response = $this->httpPost(self::RECAPTCHA_VERIFY_SERVER, '/recaptcha/api/verify', array(
-            'privatekey' => $privateKey,
-            'remoteip'   => $remoteip,
-            'challenge'  => $challenge,
-            'response'   => $response
-        ) + $extra_params);
+        try {
+            $response = $this->httpPost($url, '/recaptcha/api/verify', array(
+                    'privatekey' => $privateKey,
+                    'remoteip' => $remoteip,
+                    'challenge' => $challenge,
+                    'response' => $response
+                ) + $extra_params, $this->getOptions());
+        } catch (\Guzzle\Http\Exception\CurlException $e) {
+            if ($e->getErrorNo() == CURLE_OPERATION_TIMEOUTED) {
+                return true;
+            }
+            throw $e;
+        }
 
-        $answers = explode ("\n", $response [1]);
+        $body = $response->getBody(true);
+
+        $answers = explode ("\n", $body);
 
         if (trim($answers[0]) == 'true') {
             return true;
@@ -101,61 +123,66 @@ class TrueValidator extends ConstraintValidator
     }
 
     /**
-     * Submits an HTTP POST to a reCAPTCHA server
-     *
-     * @param string $host
-     * @param string $path
-     * @param array $data
-     * @param int port
-     *
-     * @return array response
+     * @return string
      */
-    private function httpPost($host, $path, $data, $port = 80)
+    public function getUrl()
     {
-        $req = $this->getQSEncode($data);
+        return $this->url;
+    }
 
-        $http_request  = "POST $path HTTP/1.0\r\n";
-        $http_request .= "Host: $host\r\n";
-        $http_request .= "Content-Type: application/x-www-form-urlencoded;\r\n";
-        $http_request .= "Content-Length: ".strlen($req)."\r\n";
-        $http_request .= "User-Agent: reCAPTCHA/PHP\r\n";
-        $http_request .= "\r\n";
-        $http_request .= $req;
+    /**
+     * @param string $url
+     *
+     * @return null
+     */
+    public function setUrl($url)
+    {
+        return $url;
+    }
 
-        $response = null;
-        if (!$fs = @fsockopen($host, $port, $errno, $errstr, 10)) {
-            throw new ValidatorException('Could not open socket');
+    /**
+     * @return Client
+     */
+    public function getClient() {
+        return $this->client;
+    }
+
+    public function setClient($client) {
+        if (!$client) {
+            $client = new \Guzzle\Http\Client();
         }
+        $this->client = $client;
+        $this->client->setConfig(array(
+            'curl.options' => array(
+                'CURLOPT_NOSIGNAL'   => true
+            ),
+            'select_timeout' => 0.3
+        ));
+    }
 
-        fwrite($fs, $http_request);
+    protected function httpPost($url, $path, $params, $options = array())
+    {
+        $client = $this->getClient();
+        $client->setBaseUrl($url);
 
-        while (!feof($fs)) {
-            $response .= fgets($fs, 1160); // one TCP-IP packet
-        }
-
-        fclose($fs);
-
-        $response = explode("\r\n\r\n", $response, 2);
-
+        $request = $client->post($path, null, $params, $options);
+        $response = $request->send();
         return $response;
     }
 
     /**
-     * Encodes the given data into a query string format
-     *
-     * @param $data - array of string elements to be encoded
-     *
-     * @return string - encoded request
+     * @return array
      */
-    private function getQSEncode($data)
+    public function getOptions()
     {
-        $req = null;
-        foreach ($data as $key => $value) {
-            $req .= $key.'='.urlencode(stripslashes($value)).'&';
-        }
+        return $this->options;
+    }
 
-        // cut the last '&'
-        $req = substr($req,0,strlen($req)-1);
-        return $req;
+    /**
+     * @param array $options
+     */
+    public function setOptions($options)
+    {
+        $this->options = $options;
     }
 }
